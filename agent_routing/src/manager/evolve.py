@@ -222,6 +222,19 @@ class _RemoteManagerDraftGenerator:
             "on the FIRST line as exactly one ANSWER_<TOKEN> line, then reasoning may follow."
         )
         request_messages = [dict(m) for m in messages]
+        request_messages = [dict(m) for m in messages]
+        # tool_call arguments must be a JSON *string* for the vLLM OpenAI API
+        for m in request_messages:
+            if m.get("tool_calls"):
+                m["tool_calls"] = [
+                    {**tc, "function": {
+                        **tc["function"],
+                        "arguments": tc["function"]["arguments"] if isinstance(tc["function"].get("arguments"), str)
+                                     else __import__("json").dumps(tc["function"].get("arguments") or {})
+                    }} for tc in m["tool_calls"]
+                ]
+        request_messages[0] = dict(request_messages[0])
+        request_messages[0]["content"] = str(request_messages[0].get("content") or "") + calibration
         request_messages[0] = dict(request_messages[0])
         request_messages[0]["content"] = str(request_messages[0].get("content") or "") + calibration
         # NOTE: this is a raw JSON payload, not an openai-python call —
