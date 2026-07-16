@@ -462,10 +462,15 @@ def build_reward_funcs(
             pred     = parse_final_answer(stats["last_assistant_text"], keys_list)
 
             valid_format  = pred is not None
+            # 刷屏防护:干净的 final turn 只应有一个 ANSWER_ 且不超长。GRPO 会漂移到
+            # 重复刷 ANSWER_ 填满 budget(每个都含正确答案骗过 parse、又不打 <|im_end|>),
+            # tool_rate 随之崩。多个/零个 ANSWER_ 或超长 => 判定 format 失败。
+            _ans_hits = len(re.findall(r"ANSWER_[A-Za-z0-9]", stats["last_assistant_text"]))
+            if _ans_hits != 1 or len(stats["last_assistant_text"]) > 300:
+                valid_format = False
             no_artifacts  = not stats["last_msg_has_plaintext_artifacts"]
             no_tc_in_final = not stats["last_msg_has_tool_calls"]
             base_correct  = bool(valid_format and no_artifacts and no_tc_in_final and pred == gt)
-
             k = int(stats["tool_calls"])
 
             # ---- ADC mode ----
