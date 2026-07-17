@@ -365,11 +365,24 @@ class ManagerGRPOConfig:
     clip_epsilon_high: float = 0.0       # DAPO Clip-Higher: asymmetric clip upper bound (0 = symmetric/standard)
     # Adaptive Deliberation Control reward (replaces CCR)
     adc_mode: bool = False               # enable ADC anytime per-draft reward (recommended over ccr_mode)
-    adc_cost_per_tool: float = 0.05      # per-tool cost (discourages over-calling without utility)
-    adc_draft_bonus: float = 0.2         # bonus per CORRECT draft answer (anytime reward)
-    adc_missing_draft_penalty: float = 0.1  # penalty per tool call without an accompanying draft
+    adc_cost_per_tool: float = 0.02      # per-tool cost TARGET; calibrate to <= 1/3-1/2 of the empirical
+                                         # marginal tool value (corrections-corruptions)/tool_calls
+    adc_draft_bonus: float = 0.02        # bonus scale for the anytime draft-correctness average. Kept small:
+                                         # any draft-content bonus taxes corrected trajectories and subsidizes
+                                         # k=0; honest drafts are already environment-incentivized via
+                                         # verifier_tool(current_draft) -> final accuracy
+    adc_missing_draft_penalty: float = 0.1  # penalty per tool call without an accompanying draft (format-only)
     adc_final_bonus: float = 1.0         # bonus for final correct answer
     adc_variant: str = "anytime"         # anytime | transition | sum (latter two: ablation arms only)
+    adc_format_penalty: float = 0.2      # flat penalty on policy-chosen format violations (reward clamped to
+                                         # min(r,0)-penalty; truncated rollouts are exempt)
+    adc_cost_warmup_steps: int = 100     # linearly ramp cost_per_tool 0 -> target over N steps (0 = off);
+                                         # lets tool skills form before parsimony pressure applies
+    scale_rewards: str = "none"          # GRPO advantage scaling: none|batch|group. "group" amplifies the
+                                         # tiny -cost*k gaps in all-correct groups into full-size negative
+                                         # advantages and collapses tool use as accuracy rises. "none"
+                                         # (Dr. GRPO) keeps cost at its nominal scale; "batch" is a middle
+                                         # ground if parsimony learns too slowly under "none".
 
 
 def train_manager_grpo(cfg: ManagerGRPOConfig) -> None:
@@ -593,6 +606,16 @@ def train_manager_grpo(cfg: ManagerGRPOConfig) -> None:
                 f"got {cfg.generation_batch_size} and {cfg.num_generations}."
             )
         _grpo_extra["generation_batch_size"] = int(cfg.generation_batch_size)
+    # Budget-truncated completions (no EOS) carry no usable learning signal and
+    # their rewards are dominated by the truncation, not the policy; mask them
+    # from the loss so budget events stop acting as anti-tool gradients.
+    if "mask_truncated_completions" in inspect.signature(GRPOConfig.__init__).parameters:
+        _grpo_extra["mask_truncated_completions"] = True
+    else:
+        print(
+            "[MANAGER_GRPO] WARNING: installed TRL lacks mask_truncated_completions; "
+            "budget-truncated rollouts will enter the loss. Upgrade TRL."
+        )
     grpo_args = GRPOConfig(
         output_dir=cfg.out_dir,
         remove_unused_columns=False,
@@ -605,7 +628,7 @@ def train_manager_grpo(cfg: ManagerGRPOConfig) -> None:
         learning_rate=float(cfg.learning_rate),
         bf16=(device == "cuda"),
         beta=float(cfg.grpo_beta),
-        scale_rewards="group",
+        scale_rewards=str(cfg.scale_rewards),
         report_to=(["wandb"] if cfg.use_wandb else []),
         use_vllm=False,
         per_device_train_batch_size=int(cfg.per_device_train_batch_size),
@@ -634,6 +657,8 @@ def train_manager_grpo(cfg: ManagerGRPOConfig) -> None:
         adc_missing_draft_penalty=cfg.adc_missing_draft_penalty,
         adc_final_bonus=cfg.adc_final_bonus,
         adc_variant=cfg.adc_variant,
+        adc_format_penalty=cfg.adc_format_penalty,
+        adc_cost_warmup_steps=cfg.adc_cost_warmup_steps,
         is_main_process=is_main,
     )
     if cfg.adc_mode:
@@ -642,8 +667,17 @@ def train_manager_grpo(cfg: ManagerGRPOConfig) -> None:
             f"draft_bonus={cfg.adc_draft_bonus}  "
             f"missing_draft_penalty={cfg.adc_missing_draft_penalty}  "
             f"final_bonus={cfg.adc_final_bonus}  "
-            f"cost_per_tool={cfg.adc_cost_per_tool}"
+            f"cost_per_tool={cfg.adc_cost_per_tool}  "
+            f"cost_warmup_steps={cfg.adc_cost_warmup_steps}  "
+            f"format_penalty={cfg.adc_format_penalty}  "
+            f"scale_rewards={cfg.scale_rewards}"
         )
+        if cfg.scale_rewards == "group":
+            print(
+                "[MANAGER_GRPO] WARNING: scale_rewards='group' with ADC amplifies "
+                "per-tool cost differences in all-correct groups into full-size "
+                "negative advantages -> tool-use collapse. Use 'none' or 'batch'."
+            )
         if cfg.adc_variant != "anytime":
             print(
                 f"[MANAGER_GRPO] WARNING: adc_variant={cfg.adc_variant} is a provably "
@@ -722,5 +756,9 @@ def train_manager_grpo(cfg: ManagerGRPOConfig) -> None:
         "adc_missing_draft_penalty": float(cfg.adc_missing_draft_penalty),
         "adc_final_bonus": float(cfg.adc_final_bonus),
         "adc_variant": str(cfg.adc_variant),
+        "adc_format_penalty": float(cfg.adc_format_penalty),
+        "adc_cost_warmup_steps": int(cfg.adc_cost_warmup_steps),
+        "scale_rewards": str(cfg.scale_rewards),
+        "mask_truncated_completions": bool(_grpo_extra.get("mask_truncated_completions", False)),
     })
     print(f"[MANAGER_GRPO] saved -> {cfg.out_dir}")

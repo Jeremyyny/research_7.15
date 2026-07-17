@@ -235,12 +235,16 @@ def _parse_args() -> argparse.Namespace:
                              "+draft_bonus per CORRECT DRAFT_ANSWER_, final bonus, tool cost. "
                              "Incentive-compatible (no sandbagging exploit). "
                              "Recommended over --mgr_ccr_mode.")
-    parser.add_argument("--mgr_adc_cost_per_tool", type=float, default=0.05,
-                        help="ADC per-tool cost subtracted from reward (default 0.05). "
-                             "Encourages the manager to stop calling tools when not helpful.")
-    parser.add_argument("--mgr_adc_draft_bonus", type=float, default=0.2,
-                        help="ADC bonus per CORRECT draft answer (default 0.2). "
-                             "Honest best-guess drafts are the unique optimal policy.")
+    parser.add_argument("--mgr_adc_cost_per_tool", type=float, default=0.02,
+                        help="ADC per-tool cost TARGET subtracted from reward (default 0.02). "
+                             "Calibrate to <= 1/3-1/2 of the empirical marginal tool value "
+                             "(corrections-corruptions)/tool_calls from train_raw_trace.jsonl, "
+                             "so tools stay net-positive wherever they actually help.")
+    parser.add_argument("--mgr_adc_draft_bonus", type=float, default=0.02,
+                        help="ADC bonus scale for the anytime draft-correctness average "
+                             "(default 0.02). Kept small: any draft-content bonus taxes "
+                             "corrected trajectories and subsidizes k=0; honest drafts are "
+                             "already environment-incentivized via verifier_tool(current_draft).")
     parser.add_argument("--mgr_adc_missing_draft_penalty", type=float, default=0.1,
                         help="ADC penalty per tool call without an accompanying "
                              "DRAFT_ANSWER_ (default 0.1). Enforces the draft format.")
@@ -253,6 +257,21 @@ def _parse_args() -> argparse.Namespace:
                              "the provably exploitable designs — ABLATION ARMS ONLY (RQ3): "
                              "transition pays for sandbagged first drafts, sum is farmable "
                              "by superfluous tool calls.")
+    parser.add_argument("--mgr_adc_format_penalty", type=float, default=0.2,
+                        help="ADC flat penalty for policy-chosen format violations; reward is "
+                             "clamped to min(r,0)-penalty (default 0.2). Budget-truncated "
+                             "rollouts (dangling tool call, no final answer) are exempt.")
+    parser.add_argument("--mgr_adc_cost_warmup_steps", type=int, default=100,
+                        help="Linearly ramp ADC cost_per_tool from 0 to its target over N "
+                             "steps (default 100; 0 disables). Lets the tool-use skill form "
+                             "before parsimony pressure is applied.")
+    parser.add_argument("--mgr_scale_rewards", type=str, default="none",
+                        choices=["none", "batch", "group"],
+                        help="GRPO advantage scaling (default none, Dr. GRPO style). 'group' "
+                             "divides by per-group std and amplifies the tiny -cost*k gaps in "
+                             "all-correct groups into full-size anti-tool advantages -> tool "
+                             "collapse under ADC. 'batch' is a middle ground if parsimony "
+                             "learns too slowly under 'none'.")
     parser.add_argument("--mgr_full_parameter_rl", action="store_true",
                         help="Run full-parameter GRPO. If --mgr_init_adapter is set, merge it into the base model first.")
     parser.add_argument("--mgr_max_steps", type=int, default=-1)
@@ -770,6 +789,9 @@ def main() -> None:
             adc_missing_draft_penalty=args.mgr_adc_missing_draft_penalty,
             adc_final_bonus=args.mgr_adc_final_bonus,
             adc_variant=args.mgr_adc_variant,
+            adc_format_penalty=args.mgr_adc_format_penalty,
+            adc_cost_warmup_steps=args.mgr_adc_cost_warmup_steps,
+            scale_rewards=args.mgr_scale_rewards,
             full_parameter_rl=args.mgr_full_parameter_rl,
             max_steps=args.mgr_max_steps,
             output_dir=(args.mgr_output_dir or None),
@@ -902,6 +924,9 @@ def main() -> None:
             adc_missing_draft_penalty=args.mgr_adc_missing_draft_penalty,
             adc_final_bonus=args.mgr_adc_final_bonus,
             adc_variant=args.mgr_adc_variant,
+            adc_format_penalty=args.mgr_adc_format_penalty,
+            adc_cost_warmup_steps=args.mgr_adc_cost_warmup_steps,
+            scale_rewards=args.mgr_scale_rewards,
             full_parameter_rl=args.mgr_full_parameter_rl,
             max_steps=args.mgr_max_steps,
             output_dir=(args.mgr_output_dir or None),

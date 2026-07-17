@@ -19,7 +19,27 @@ Three reward modes:
        -missing_draft_penalty  per tool call not accompanied by a draft
        +final_bonus            if the final submitted answer is correct
        -cost_per_tool          per tool called (encourages stopping early)
-     Falls back to binary final reward if no DRAFT_ANSWER_ tokens are present.
+     Note: when no DRAFT_ANSWER_ tokens are present the draft term is 0 but
+     cost_per_tool and missing_draft_penalty still apply (this is NOT a
+     fallback to binary).
+
+     Anti-collapse design (see tests/test_adc_reward.py):
+     - cost_per_tool warms up linearly over adc_cost_warmup_steps so the
+       tool-use skill can form before parsimony pressure is applied.
+     - Budget-truncated rollouts (trajectory ends in a dangling tool call
+       with no final answer, e.g. TRL rolled the tool result back) are NOT
+       hit with the format penalty: the truncation was not a policy choice,
+       and hammering it only punishes tool use. Pair with TRL's
+       mask_truncated_completions so these rollouts are masked from the loss.
+     - Format violations clamp the reward to min(r, 0) - format_penalty
+       instead of subtracting final_bonus + draft_bonus, so the reward floor
+       does not deepen with k (otherwise the worst rewards in the space are
+       all tool-using trajectories and GRPO learns tool aversion).
+     - IMPORTANT: this reward is designed for scale_rewards="none" (or
+       "batch"). With per-group std normalization ("group"), all-correct
+       groups have tiny std and the -cost_per_tool*k differences get
+       amplified into full-size negative advantages on every solved prompt,
+       which collapses tool use as accuracy rises.
 
      Incentive-compatibility notes (both exploits are tested in
      tests/test_adc_reward.py-style smoke checks):
@@ -415,11 +435,13 @@ def build_reward_funcs(
     ccr_p_low: float = 0.6,
     ccr_k_max: int = 3,
     adc_mode: bool = False,
-    adc_cost_per_tool: float = 0.05,
-    adc_draft_bonus: float = 0.2,
+    adc_cost_per_tool: float = 0.02,
+    adc_draft_bonus: float = 0.02,
     adc_missing_draft_penalty: float = 0.1,
     adc_final_bonus: float = 1.0,
     adc_variant: str = "anytime",
+    adc_format_penalty: float = 0.2,
+    adc_cost_warmup_steps: int = 100,
     is_main_process: bool = True,
 ):
     """Construct the reward function list passed to GRPOTrainer.
@@ -429,6 +451,11 @@ def build_reward_funcs(
     ADC mode (recommended):
         Anytime per-draft correctness reward + final correctness - tool cost.
         Incentive-compatible: honest drafts are optimal (see module docstring).
+        adc_cost_warmup_steps > 0 linearly ramps cost_per_tool from 0 to its
+        target over that many steps (0 disables the warmup). Calibrate the
+        target from traces: cost_per_tool should be at most ~1/3-1/2 of
+        (corrections - corruptions) / total tool calls * final_bonus, so
+        tools stay net-positive in expectation wherever they actually help.
 
     CCR mode (legacy):
         Log scoring rule on implicit confidence from k.
@@ -439,6 +466,11 @@ def build_reward_funcs(
         R = 1.0 if correct else 0.0, plus optional bonuses.
     """
 
+    # Fallback step counter for the cost warmup when TRL does not pass
+    # trainer_state to reward functions (counts reward invocations, which
+    # tracks optimizer steps closely enough for a warmup schedule).
+    _call_count = {"n": 0}
+
     def reward_fn(
         prompts=None,
         completions=None,
@@ -447,6 +479,16 @@ def build_reward_funcs(
         choice_keys=None,
         **kwargs,
     ) -> List[float]:
+        _call_count["n"] += 1
+        if adc_cost_warmup_steps > 0:
+            _ts = kwargs.get("trainer_state")
+            _step = getattr(_ts, "global_step", None) if _ts is not None else None
+            if _step is None:
+                _step = _call_count["n"]
+            cost_now = adc_cost_per_tool * min(1.0, float(_step) / float(adc_cost_warmup_steps))
+        else:
+            cost_now = adc_cost_per_tool
+
         n     = len(completions)
         gts   = _ensure_list(ground_truth, n)
         eids  = _ensure_list(example_id, n)
@@ -465,7 +507,9 @@ def build_reward_funcs(
             # 刷屏防护:干净的 final turn 只应有一个 ANSWER_ 且不超长。GRPO 会漂移到
             # 重复刷 ANSWER_ 填满 budget(每个都含正确答案骗过 parse、又不打 <|im_end|>),
             # tool_rate 随之崩。多个/零个 ANSWER_ 或超长 => 判定 format 失败。
-            _ans_hits = len(re.findall(r"ANSWER_[A-Za-z0-9]", stats["last_assistant_text"]))
+            # (?<!DRAFT_): SFT 学出的"final turn 先 draft 再 answer"习惯不该吃格式罚,
+            # 否则 RL 初期定点爆破的正是和工具使用绑定的 deliberation 行为。
+            _ans_hits = len(re.findall(r"(?<!DRAFT_)ANSWER_[A-Za-z0-9]", stats["last_assistant_text"]))
             if _ans_hits != 1 or len(stats["last_assistant_text"]) > 300:
                 valid_format = False
             no_artifacts  = not stats["last_msg_has_plaintext_artifacts"]
@@ -476,6 +520,12 @@ def build_reward_funcs(
             # ---- ADC mode ----
             if adc_mode:
                 y_hat_seq = extract_answer_sequence(c, keys_list)
+                # Dangling tool call with no final answer = the rollout was cut
+                # by the completion budget (TRL rolls the tool result back),
+                # not a policy choice. Exempt it from the format penalty —
+                # otherwise every budget event is a large anti-tool gradient
+                # that only tool-using trajectories can receive.
+                is_truncated = bool(stats["last_msg_has_tool_calls"]) and pred is None
                 adc_r, adc_stats = _compute_adc_reward(
                     y_hat_seq=y_hat_seq,
                     ground_truth=str(gt),
@@ -483,13 +533,18 @@ def build_reward_funcs(
                     draft_bonus=adc_draft_bonus,
                     missing_draft_penalty=adc_missing_draft_penalty,
                     final_bonus=adc_final_bonus,
-                    cost_per_tool=adc_cost_per_tool,
+                    cost_per_tool=cost_now,
                     has_final=(pred is not None),
                     variant=adc_variant,
                 )
-                if not (valid_format and no_artifacts and no_tc_in_final):
-                    # Format violation: zero final bonus, add format penalty
-                    adc_r = adc_r - adc_final_bonus - adc_draft_bonus
+                if not (valid_format and no_artifacts and no_tc_in_final) and not is_truncated:
+                    # Format violation chosen by the policy: forfeit any
+                    # positive reward and pay a flat penalty. Clamp instead of
+                    # subtracting final_bonus+draft_bonus so the floor does not
+                    # deepen with k (the old blanket -1.2 put every deep reward
+                    # valley on the tool-using side of the space).
+                    adc_r = min(adc_r, 0.0) - adc_format_penalty
+                adc_stats["truncated"] = bool(is_truncated)
                 reward = float(adc_r)
 
             # ---- CCR mode (legacy) ----
@@ -550,6 +605,8 @@ def build_reward_funcs(
                         "draft_reward": adc_stats.get("draft_reward", 0.0),
                         "final_reward": adc_stats.get("final_reward", 0.0),
                         "tool_cost": adc_stats.get("tool_cost", 0.0),
+                        "truncated": adc_stats.get("truncated", False),
+                        "cost_per_tool_effective": round(float(cost_now), 4),
                     })
                 elif ccr_mode:
                     trace_entry["implicit_confidence"] = round(

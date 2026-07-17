@@ -231,9 +231,15 @@ def extract_answer_sequence(
 ) -> List[Optional[str]]:
     """Extract the full sequence of candidate answers from a completion.
 
-    Scans every assistant turn for DRAFT_ANSWER_ and the final ANSWER_.
-    Returns list of (draft_0, draft_1, ..., final) in chronological order.
-    Used by the ADC reward function.
+    Scans every assistant turn for DRAFT_ANSWER_; only the LAST assistant
+    turn contributes the final ANSWER_. Returns (draft_0, ..., final) in
+    chronological order. Used by the ADC reward function.
+
+    Bare ANSWER_ lines in intermediate turns are deliberately IGNORED:
+    counting them would (a) let the policy satisfy the missing-draft penalty
+    without ever using the DRAFT_ format, and (b) let it dilute an early
+    wrong draft by echoing the (post-tool-result) answer as extra entries in
+    the anytime average — a small but farmable reward leak.
     """
     if not isinstance(completion, list):
         text = str(completion) if completion else ""
@@ -246,7 +252,7 @@ def extract_answer_sequence(
             result.append(final)
         return result
 
-    sequence: List[Optional[str]] = []
+    texts: List[str] = []
     for msg in completion:
         if not isinstance(msg, dict) or msg.get("role") != "assistant":
             continue
@@ -258,12 +264,17 @@ def extract_answer_sequence(
             )
         else:
             text = str(content or "")
+        texts.append(text)
+
+    sequence: List[Optional[str]] = []
+    for i, text in enumerate(texts):
         if not text.strip():
             continue
         draft = parse_draft_answer(text, choice_keys)
         if draft is not None:
             sequence.append(draft)
-        final = parse_final_answer(text, choice_keys)
-        if final is not None:
-            sequence.append(final)
+        if i == len(texts) - 1:
+            final = parse_final_answer(text, choice_keys)
+            if final is not None:
+                sequence.append(final)
     return sequence
